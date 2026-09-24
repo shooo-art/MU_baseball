@@ -95,6 +95,34 @@ body{
   font-size:11px;
   color: var(--text-soft);
 }
+.summary-pill .num small{
+  font-size:12px;
+  font-weight:700;
+  margin-left:1px;
+}
+.summary-pill .lbl{ display:block; }
+.pill-detail{
+  margin-top:6px;
+  padding-top:6px;
+  border-top:1px dashed rgba(0,0,0,0.12);
+  font-size:10.5px;
+  line-height:1.5;
+  color: var(--text);
+  text-align:left;
+}
+.pill-detail .row{
+  display:flex;
+  justify-content:space-between;
+  gap:4px;
+}
+.pill-detail .row .n{
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.pill-detail .row .q{ font-weight:800; flex-shrink:0; }
+.pill-detail .none{ color: var(--text-soft); text-align:center; }
+.summary-row{ align-items:stretch; }
 .summary-pill.warn .num{ color: var(--amber-dark); }
 .summary-pill.bad .num{ color: var(--coral-dark); }
 .summary-pill.ok .num{ color: var(--mint-dark); }
@@ -629,9 +657,24 @@ body{
 
   function render(){
     const sorted = [...drinks].sort((a,b)=> daysUntil(a.expiry) - daysUntil(b.expiry));
-    const warnCount = sorted.filter(d => statusOf(daysUntil(d.expiry)) === 'warn').length;
-    const badCount = sorted.filter(d => statusOf(daysUntil(d.expiry)) === 'bad').length;
-    const okCount = sorted.length - warnCount - badCount;
+    // 状態ごとに「本数」と「飲み物ごとの内訳」を集計
+    const byStatus = { ok:{total:0, items:{}}, warn:{total:0, items:{}}, bad:{total:0, items:{}} };
+    for(const d of sorted){
+      const st = statusOf(daysUntil(d.expiry));
+      const q = d.qty || 1;
+      byStatus[st].total += q;
+      byStatus[st].items[d.name] = (byStatus[st].items[d.name] || 0) + q;
+    }
+    const okCount = byStatus.ok.total;
+    const warnCount = byStatus.warn.total;
+    const badCount = byStatus.bad.total;
+    const pillDetail = (st) => {
+      const entries = Object.entries(byStatus[st].items).sort((a,b)=> b[1]-a[1]);
+      if(entries.length === 0) return `<div class="pill-detail"><div class="none">なし</div></div>`;
+      return `<div class="pill-detail">${entries.map(([n,q]) =>
+        `<div class="row"><span class="n">${escapeHtml(n)}</span><span class="q">${q}本</span></div>`
+      ).join('')}</div>`;
+    };
 
     let html = `
       <div class="hero">
@@ -645,9 +688,9 @@ body{
         <p class="hero-title">🥤 のみもの在庫ノート</p>
         <p class="hero-sub">市高野球部⚾</p>
         <div class="summary-row">
-          <div class="summary-pill ok"><span class="num">${okCount}</span><span class="lbl">まだ大丈夫</span></div>
-          <div class="summary-pill warn"><span class="num">${warnCount}</span><span class="lbl">もうすぐ期限</span></div>
-          <div class="summary-pill bad"><span class="num">${badCount}</span><span class="lbl">期限切れ</span></div>
+          <div class="summary-pill ok"><span class="num">${okCount}<small>本</small></span><span class="lbl">まだ大丈夫</span>${pillDetail('ok')}</div>
+          <div class="summary-pill warn"><span class="num">${warnCount}<small>本</small></span><span class="lbl">もうすぐ期限</span>${pillDetail('warn')}</div>
+          <div class="summary-pill bad"><span class="num">${badCount}<small>本</small></span><span class="lbl">期限切れ</span>${pillDetail('bad')}</div>
         </div>
       </div>
     `;
@@ -656,7 +699,7 @@ body{
       html += `
         <div class="alert-banner">
           <span class="icon">⏰</span>
-          <div>${badCount > 0 ? `<b>${badCount}件が期限切れ</b>、` : ''}${warnCount > 0 ? `<b>${warnCount}件</b>が1ヶ月以内に期限が来るよ` : ''}</div>
+          <div>${badCount > 0 ? `<b>${badCount}本が期限切れ</b>、` : ''}${warnCount > 0 ? `<b>${warnCount}本</b>が1ヶ月以内に期限が来るよ` : ''}</div>
         </div>
       `;
     }
