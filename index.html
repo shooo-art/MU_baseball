@@ -569,7 +569,11 @@ body{
         if(wait > 0) await sleep(wait);
         lastRequestAt = Date.now();
         try{
-          res = await fetch(apiUrl(), { cache: 'no-store', ...options });
+          const ctrl = new AbortController();
+          const timer = setTimeout(()=> ctrl.abort(), 12000);
+          try{
+            res = await fetch(apiUrl(), { cache: 'no-store', signal: ctrl.signal, ...options });
+          }finally{ clearTimeout(timer); }
           // 回数制限・サーバー混雑のときだけ再挑戦
           if(res.status !== 429 && res.status < 500) return res;
         }catch(e){
@@ -587,7 +591,17 @@ body{
 
   let basketMissing = false;
   let lastError = '';
-  const APP_VERSION = 'v3';
+  const APP_VERSION = 'v4';
+
+  // 保存中はボタンを押せなくして「保存中…」と表示する
+  function lockButton(el, label){
+    if(!el) return ()=>{};
+    const orig = el.textContent;
+    el.disabled = true;
+    el.style.opacity = '0.6';
+    el.textContent = label || '保存中…';
+    return ()=>{ el.disabled = false; el.style.opacity = ''; el.textContent = orig; };
+  }
 
   async function loadDrinks(){
     try{
@@ -932,6 +946,8 @@ body{
       });
       document.getElementById('cancelConsume').addEventListener('click', closeSheet);
       document.getElementById('confirmConsume').addEventListener('click', async ()=>{
+        if(syncing) return;
+        lockButton(document.getElementById('confirmConsume'));
         let qty = parseInt(document.getElementById('consumeQtyInput').value, 10);
         if(!qty || qty < 1) qty = 1;
         const consumedDate = document.getElementById('consumeDateInput').value || todayStr();
@@ -1017,6 +1033,8 @@ body{
     document.getElementById('backToListBtn').addEventListener('click', render);
     app.querySelectorAll('[data-histdel]').forEach(btn=>{
       btn.addEventListener('click', async ()=>{
+        if(syncing) return;
+        lockButton(btn, '…');
         const hid = btn.dataset.histdel;
         const ok = await syncChange(()=>{
           history = history.filter(d => d.id !== hid);
@@ -1107,6 +1125,7 @@ body{
   }
 
   async function handleSave(){
+    if(syncing) return;
     const name = document.getElementById('nameInput').value.trim();
     const place = document.getElementById('placeInput').value.trim();
     const buyer = document.getElementById('buyerInput').value.trim();
@@ -1117,6 +1136,7 @@ body{
     if(!name){ showToast('品名を入力してね'); return; }
     if(!expiry){ showToast('賞味期限を入力してね'); return; }
 
+    lockButton(document.getElementById('saveBtn'));
     const wasEditing = !!editingId;
     const editId = editingId;
     const ok = await syncChange(()=>{
@@ -1152,6 +1172,9 @@ body{
   }
 
   async function doDelete(){
+    if(syncing) return; // 前の処理が終わるまで何もしない
+    lockButton(document.getElementById('confirmDel'), '削除中…');
+    lockButton(document.getElementById('cancelDel'));
     const id = pendingDeleteId;
     const ok = await syncChange(()=>{
       drinks = drinks.filter(d => d.id !== id);
