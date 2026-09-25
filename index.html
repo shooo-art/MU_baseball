@@ -549,7 +549,7 @@ body{
 
   async function loadDrinks(){
     try{
-      const res = await fetch(apiUrl(), { method: 'GET' });
+      const res = await fetch(apiUrl(), { method: 'GET', cache: 'no-store' });
       if(res.status === 400 || res.status === 404){
         // 初回アクセスなど、バスケットがまだ存在しない場合のみ空扱いにする
         drinks = [];
@@ -577,17 +577,45 @@ body{
     }
   }
 
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
   async function saveDrinks(){
-    try{
-      const res = await fetch(apiUrl(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ drinks, history })
-      });
-      if(!res.ok) throw new Error('save failed');
-    }catch(e){
-      showToast('保存に失敗したよ…もう一度試してね');
+    for(let attempt = 0; attempt < 2; attempt++){
+      try{
+        const res = await fetch(apiUrl(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
+          body: JSON.stringify({ drinks, history })
+        });
+        if(res.ok) return true;
+      }catch(e){}
+      await sleep(1200); // 混雑・一瞬の通信失敗なら少し待ってもう一度
     }
+    return false;
+  }
+
+  // 変更の前に必ずサーバーの最新データを読み直してから、変更して保存する。
+  // （古い画面のまま保存して、ほかの人が消したものが復活するのを防ぐ）
+  let syncing = false;
+  async function syncChange(applyFn){
+    if(syncing) return false; // 連打で二重に保存しないように
+    syncing = true;
+    try{ return await syncChangeInner(applyFn); } finally { syncing = false; }
+  }
+  async function syncChangeInner(applyFn){
+    showToast('保存中…');
+    await loadDrinksWithRetry();
+    if(lastLoadFailed) return false;
+    const result = applyFn();
+    if(result === false) return false;
+    await sleep(600);
+    const ok = await saveDrinks();
+    if(!ok){
+      await loadDrinks(); // 失敗したらサーバーの本当の状態に表示を戻す
+      return false;
+    }
+    return true;
   }
 
   function renderSetup(){
@@ -853,30 +881,33 @@ body{
       });
       document.getElementById('cancelConsume').addEventListener('click', closeSheet);
       document.getElementById('confirmConsume').addEventListener('click', async ()=>{
-        const available = totals[selectedName];
         let qty = parseInt(document.getElementById('consumeQtyInput').value, 10);
         if(!qty || qty < 1) qty = 1;
-        if(qty > available) qty = available;
         const consumedDate = document.getElementById('consumeDateInput').value || todayStr();
         const eventVal = document.getElementById('eventInput').value.trim();
 
-        let remaining = qty;
-        const matching = drinks
-          .filter(d => d.name === selectedName)
-          .sort((a,b) => (a.expiry || '').localeCompare(b.expiry || ''));
-        for(const entry of matching){
-          if(remaining <= 0) break;
-          const take = Math.min(entry.qty || 1, remaining);
-          entry.qty = (entry.qty || 1) - take;
-          remaining -= take;
-        }
-        drinks = drinks.filter(d => (d.qty || 0) > 0);
+        const ok = await syncChange(()=>{
+          // 最新データで在庫数を数え直す
+          const matching = drinks
+            .filter(d => d.name === selectedName)
+            .sort((a,b) => (a.expiry || '').localeCompare(b.expiry || ''));
+          const available = matching.reduce((sum, d) => sum + (d.qty || 1), 0);
+          if(available === 0) return false;
+          if(qty > available) qty = available;
 
-        history.unshift({ id: uid(), name: selectedName, qty, consumedDate, event: eventVal });
-        await saveDrinks();
+          let remaining = qty;
+          for(const entry of matching){
+            if(remaining <= 0) break;
+            const take = Math.min(entry.qty || 1, remaining);
+            entry.qty = (entry.qty || 1) - take;
+            remaining -= take;
+          }
+          drinks = drinks.filter(d => (d.qty || 0) > 0);
+          history.unshift({ id: uid(), name: selectedName, qty, consumedDate, event: eventVal });
+        });
         closeSheet();
         render();
-        showToast(`${selectedName}を${qty}本、消費済に記録したよ`);
+        showToast(ok ? `${selectedName}を${qty}本、消費済に記録したよ` : '記録できなかったよ…通信を確認してもう一度試してね');
       });
     }
 
@@ -935,10 +966,12 @@ body{
     document.getElementById('backToListBtn').addEventListener('click', render);
     app.querySelectorAll('[data-histdel]').forEach(btn=>{
       btn.addEventListener('click', async ()=>{
-        history = history.filter(d => d.id !== btn.dataset.histdel);
-        await saveDrinks();
+        const hid = btn.dataset.histdel;
+        const ok = await syncChange(()=>{
+          history = history.filter(d => d.id !== hid);
+        });
         renderHistory();
-        showToast('履歴から削除したよ');
+        showToast(ok ? '履歴から削除したよ' : '削除できなかったよ…通信を確認してもう一度試してね');
       });
     });
   }
@@ -1033,16 +1066,19 @@ body{
     if(!name){ showToast('品名を入力してね'); return; }
     if(!expiry){ showToast('賞味期限を入力してね'); return; }
 
-    if(editingId){
-      const item = drinks.find(d => d.id === editingId);
-      Object.assign(item, { name, place, buyer, expiry, qty });
-    }else{
-      drinks.push({ id: uid(), name, place, buyer, expiry, qty });
-    }
-    await saveDrinks();
+    const wasEditing = !!editingId;
+    const editId = editingId;
+    const ok = await syncChange(()=>{
+      const item = wasEditing ? drinks.find(d => d.id === editId) : null;
+      if(item){
+        Object.assign(item, { name, place, buyer, expiry, qty });
+      }else{
+        drinks.push({ id: wasEditing ? editId : uid(), name, place, buyer, expiry, qty });
+      }
+    });
     closeSheet();
     render();
-    showToast(editingId ? '更新したよ' : '追加したよ');
+    showToast(ok ? (wasEditing ? '更新したよ' : '追加したよ') : '保存できなかったよ…通信を確認してもう一度試してね');
   }
 
   function askDelete(id){
@@ -1065,11 +1101,13 @@ body{
   }
 
   async function doDelete(){
-    drinks = drinks.filter(d => d.id !== pendingDeleteId);
-    await saveDrinks();
+    const id = pendingDeleteId;
+    const ok = await syncChange(()=>{
+      drinks = drinks.filter(d => d.id !== id);
+    });
     closeSheet();
     render();
-    showToast('削除したよ');
+    showToast(ok ? '削除したよ' : '削除できなかったよ…通信を確認してもう一度試してね');
   }
 
   overlay.addEventListener('click', closeSheet);
