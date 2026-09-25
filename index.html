@@ -473,10 +473,17 @@ body{
 
   function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
 
-  function showToast(msg){
+  let toastTimer = null;
+  function showToast(msg, ms){
     toastEl.textContent = msg;
     toastEl.classList.add('show');
-    setTimeout(()=> toastEl.classList.remove('show'), 1800);
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(()=> toastEl.classList.remove('show'), ms || 1800);
+  }
+  function errMsg(base){
+    // 理由も出して、長めに表示する
+    setTimeout(()=> showToast(`${base}（${lastError || '理由不明'}）`, 6000), 0);
+    return `${base}（${lastError || '理由不明'}）`;
   }
 
   function daysUntil(dateStr){
@@ -579,6 +586,8 @@ body{
   }
 
   let basketMissing = false;
+  let lastError = '';
+  const APP_VERSION = 'v3';
 
   async function loadDrinks(){
     try{
@@ -592,13 +601,18 @@ body{
         return;
       }
       basketMissing = false;
-      if(!res.ok) throw new Error('load failed');
+      if(!res.ok){
+        let t = ''; try{ t = (await res.text()).slice(0,60); }catch(e){}
+        lastError = `読込${res.status} ${t}`;
+        throw new Error('load failed');
+      }
       const data = await res.json();
       drinks = Array.isArray(data.drinks) ? data.drinks : [];
       history = Array.isArray(data.history) ? data.history : [];
       lastLoadFailed = false;
     }catch(e){
       // 通信が一瞬失敗しただけかもしれないので、今表示している内容は消さない
+      if(!lastError) lastError = '読込:通信エラー ' + (e && e.message || '');
       lastLoadFailed = true;
       showToast('読み込みに失敗したよ。通信環境を確認してね');
     }
@@ -618,8 +632,12 @@ body{
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ drinks, history })
       });
-      return res.ok;
+      if(res.ok) return true;
+      let t = ''; try{ t = (await res.text()).slice(0,60); }catch(e){}
+      lastError = `保存${res.status} ${t}`;
+      return false;
     }catch(e){
+      lastError = '保存:通信エラー ' + (e && e.message || '');
       return false;
     }
   }
@@ -628,20 +646,21 @@ body{
   // （古い画面のまま保存して、ほかの人が消したものが復活するのを防ぐ）
   let syncing = false;
   async function syncChange(applyFn){
-    if(syncing) return false; // 連打で二重に保存しないように
+    if(syncing){ lastError = '前の保存がまだ途中'; return false; } // 連打で二重に保存しないように
     syncing = true;
     try{ return await syncChangeInner(applyFn); } finally { syncing = false; }
   }
   async function syncChangeInner(applyFn){
     showToast('保存中…');
+    lastError = '';
     const hadData = drinks.length > 0 || history.length > 0;
     await loadDrinksWithRetry();
     if(lastLoadFailed) return false;
     // 「データが空」と返ってきたのに、さっきまでデータがあった場合は
     // 何かおかしいので保存しない（全部消えてしまうのを防ぐ）
-    if(basketMissing && hadData) return false;
+    if(basketMissing && hadData){ lastError = 'データが空で返ってきた'; return false; }
     const result = applyFn();
-    if(result === false) return false;
+    if(result === false){ lastError = lastError || '対象が見つからない'; return false; }
     const ok = await saveDrinks();
     if(!ok){
       await loadDrinks(); // 失敗したらサーバーの本当の状態に表示を戻す
@@ -746,7 +765,7 @@ body{
           <button class="icon-btn" id="settingsBtn" style="background:rgba(255,255,255,0.75); width:32px; height:32px; font-size:15px;">⚙️</button>
         </div>
         <p class="hero-title">🥤 のみもの在庫ノート</p>
-        <p class="hero-sub">市高野球部⚾</p>
+        <p class="hero-sub">市高野球部⚾ <span style="font-size:10px; opacity:0.6;">${APP_VERSION}</span></p>
         <div class="summary-row">
           <div class="summary-pill ok"><span class="num">${okCount}<small>本</small></span><span class="lbl">まだ大丈夫</span>${pillDetail('ok')}</div>
           <div class="summary-pill warn"><span class="num">${warnCount}<small>本</small></span><span class="lbl">もうすぐ期限</span>${pillDetail('warn')}</div>
@@ -939,7 +958,7 @@ body{
         });
         closeSheet();
         render();
-        showToast(ok ? `${selectedName}を${qty}本、消費済に記録したよ` : '記録できなかったよ…通信を確認してもう一度試してね');
+        showToast(ok ? `${selectedName}を${qty}本、消費済に記録したよ` : errMsg('記録できなかったよ'));
       });
     }
 
@@ -1003,7 +1022,7 @@ body{
           history = history.filter(d => d.id !== hid);
         });
         renderHistory();
-        showToast(ok ? '履歴から削除したよ' : '削除できなかったよ…通信を確認してもう一度試してね');
+        showToast(ok ? '履歴から削除したよ' : errMsg('削除できなかったよ'));
       });
     });
   }
@@ -1110,7 +1129,7 @@ body{
     });
     closeSheet();
     render();
-    showToast(ok ? (wasEditing ? '更新したよ' : '追加したよ') : '保存できなかったよ…通信を確認してもう一度試してね');
+    showToast(ok ? (wasEditing ? '更新したよ' : '追加したよ') : errMsg('保存できなかったよ'));
   }
 
   function askDelete(id){
@@ -1139,7 +1158,7 @@ body{
     });
     closeSheet();
     render();
-    showToast(ok ? '削除したよ' : '削除できなかったよ…通信を確認してもう一度試してね');
+    showToast(ok ? '削除したよ' : errMsg('削除できなかったよ'));
   }
 
   overlay.addEventListener('click', closeSheet);
