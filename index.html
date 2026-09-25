@@ -463,7 +463,6 @@ body{
   let editingId = null;
   let pendingDeleteId = null;
   let formIcon = PRESET_DRINKS[0];
-  let pantryId = null;
   let lastLoadFailed = false;
 
   const app = document.getElementById('app');
@@ -540,58 +539,28 @@ body{
     return `<svg viewBox="0 0 48 48"><path d="M14 12h20l-2 24a4 4 0 0 1-4 4H20a4 4 0 0 1-4-4L14 12z" fill="${ic.color}" stroke="${ic.dark}" stroke-width="2"/><path d="M34 16h4a4 4 0 0 1 0 8h-3" fill="none" stroke="${ic.dark}" stroke-width="2"/></svg>`;
   }
 
-  function apiUrl(){
-    return `https://getpantry.cloud/apiv1/pantry/${encodeURIComponent(pantryId)}/basket/${BASKET_NAME}`;
-  }
+  // ===== 保存先：Firebase（Cloud Firestore） =====
+  // ↓ Firebase のプロジェクトIDをここに入れる
+  const FIREBASE_PROJECT_ID = 'mu-baseball';
 
-  function syncUrlWithPantryId(){
-    try{
-      const url = new URL(window.location.href);
-      if(url.searchParams.get('pid') !== pantryId){
-        url.searchParams.set('pid', pantryId);
-        window.history.replaceState(null, '', url.toString());
-      }
-    }catch(e){}
-  }
-
+  const APP_VERSION = 'v6';
+  const DOC_URL = () =>
+    `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/inventory/main`;
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // Pantry は短時間に何回も通信すると断られる（回数制限）ので、
-  // 通信は1つずつ順番に、前回から少し間隔をあけて送る。断られたら待って再挑戦。
-  const MIN_GAP_MS = 1300;
-  let lastRequestAt = 0;
-  let requestQueue = Promise.resolve();
-  function pantryFetch(options){
-    const run = async () => {
-      let res = null;
-      for(let attempt = 0; attempt < 4; attempt++){
-        const wait = lastRequestAt + MIN_GAP_MS - Date.now();
-        if(wait > 0) await sleep(wait);
-        lastRequestAt = Date.now();
-        try{
-          const ctrl = new AbortController();
-          const timer = setTimeout(()=> ctrl.abort(), 12000);
-          try{
-            res = await fetch(apiUrl(), { cache: 'no-store', signal: ctrl.signal, ...options });
-          }finally{ clearTimeout(timer); }
-          // 回数制限・サーバー混雑のときだけ再挑戦
-          if(res.status !== 429 && res.status < 500) return res;
-        }catch(e){
-          res = null;
-        }
-        await sleep(1500 * (attempt + 1));
-      }
-      if(res) return res;
-      throw new Error('network error');
-    };
-    const p = requestQueue.then(run, run);
-    requestQueue = p.catch(()=>{});
-    return p;
-  }
-
-  let basketMissing = false;
   let lastError = '';
-  const APP_VERSION = 'v4';
+  let sheetInitialized = true; // 一度でも保存されたことがあるか
+  let docUpdateTime = null;    // 最後に読んだときのデータの更新時刻（上書き事故防止に使う）
+
+  async function timedFetch(url, opts){
+    const ctrl = new AbortController();
+    const timer = setTimeout(()=> ctrl.abort(), 15000);
+    try{
+      return await fetch(url, { cache: 'no-store', signal: ctrl.signal, ...opts });
+    }finally{
+      clearTimeout(timer);
+    }
+  }
 
   // 保存中はボタンを押せなくして「保存中…」と表示する
   function lockButton(el, label){
@@ -604,137 +573,166 @@ body{
   }
 
   async function loadDrinks(){
-    try{
-      const res = await pantryFetch({ method: 'GET' });
-      if(res.status === 400 || res.status === 404){
-        // 初回アクセスなど、バスケットがまだ存在しない場合のみ空扱いにする
-        drinks = [];
-        history = [];
-        basketMissing = true;
+    let err = null;
+    for(let attempt = 0; attempt < 2; attempt++){
+      try{
+        const res = await timedFetch(DOC_URL(), { method: 'GET' });
+        if(res.status === 404){
+          // まだ一度も保存されていない
+          drinks = []; history = [];
+          sheetInitialized = false;
+          docUpdateTime = null;
+          lastLoadFailed = false;
+          return;
+        }
+        if(!res.ok){
+          let t = ''; try{ t = (await res.text()).slice(0,80); }catch(e){}
+          throw new Error(`${res.status} ${t}`);
+        }
+        const doc = await res.json();
+        const raw = doc.fields && doc.fields.data && doc.fields.data.stringValue;
+        const data = raw ? JSON.parse(raw) : {};
+        drinks = Array.isArray(data.drinks) ? data.drinks : [];
+        history = Array.isArray(data.history) ? data.history : [];
+        sheetInitialized = true;
+        docUpdateTime = doc.updateTime || null;
         lastLoadFailed = false;
         return;
+      }catch(e){
+        err = e;
+        await sleep(1200);
       }
-      basketMissing = false;
-      if(!res.ok){
-        let t = ''; try{ t = (await res.text()).slice(0,60); }catch(e){}
-        lastError = `読込${res.status} ${t}`;
-        throw new Error('load failed');
-      }
-      const data = await res.json();
-      drinks = Array.isArray(data.drinks) ? data.drinks : [];
-      history = Array.isArray(data.history) ? data.history : [];
-      lastLoadFailed = false;
-    }catch(e){
-      // 通信が一瞬失敗しただけかもしれないので、今表示している内容は消さない
-      if(!lastError) lastError = '読込:通信エラー ' + (e && e.message || '');
-      lastLoadFailed = true;
-      showToast('読み込みに失敗したよ。通信環境を確認してね');
     }
+    // 通信が一瞬失敗しただけかもしれないので、今表示している内容は消さない
+    lastError = '読込: ' + (err && err.message || '通信エラー');
+    lastLoadFailed = true;
+    showToast('読み込みに失敗したよ。通信環境を確認してね');
   }
 
   async function loadDrinksWithRetry(){
     await loadDrinks();
-    if(lastLoadFailed){
-      await loadDrinks();
-    }
   }
 
+  // 戻り値: 'ok' / 'conflict'（読んだ後にほかの人が保存した） / 'error'
   async function saveDrinks(){
+    const pre = docUpdateTime
+      ? `currentDocument.updateTime=${encodeURIComponent(docUpdateTime)}`
+      : 'currentDocument.exists=false';
     try{
-      const res = await pantryFetch({
-        method: 'POST',
+      const res = await timedFetch(`${DOC_URL()}?${pre}`, {
+        method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ drinks, history })
+        body: JSON.stringify({ fields: { data: { stringValue: JSON.stringify({ drinks, history }) } } })
       });
-      if(res.ok) return true;
-      let t = ''; try{ t = (await res.text()).slice(0,60); }catch(e){}
-      lastError = `保存${res.status} ${t}`;
-      return false;
+      if(res.ok){
+        const doc = await res.json();
+        docUpdateTime = doc.updateTime || null;
+        sheetInitialized = true;
+        return 'ok';
+      }
+      let t = ''; try{ t = await res.text(); }catch(e){}
+      if(res.status === 409 || t.includes('FAILED_PRECONDITION') || t.includes('ALREADY_EXISTS') || t.includes('NOT_FOUND')){
+        return 'conflict';
+      }
+      lastError = `保存: ${res.status} ${t.slice(0,80)}`;
+      return 'error';
     }catch(e){
-      lastError = '保存:通信エラー ' + (e && e.message || '');
-      return false;
+      lastError = '保存: ' + (e && e.message || '通信エラー');
+      return 'error';
     }
   }
 
-  // 変更の前に必ずサーバーの最新データを読み直してから、変更して保存する。
-  // （古い画面のまま保存して、ほかの人が消したものが復活するのを防ぐ）
+  // 最新データを読む → 変更する → 保存。
+  // 読んだ後にほかの人が保存していたら、読み直してやり直す（消したものの復活を防ぐ）
   let syncing = false;
   async function syncChange(applyFn){
-    if(syncing){ lastError = '前の保存がまだ途中'; return false; } // 連打で二重に保存しないように
+    if(syncing){ lastError = '前の保存がまだ途中'; return false; }
     syncing = true;
     try{ return await syncChangeInner(applyFn); } finally { syncing = false; }
   }
   async function syncChangeInner(applyFn){
-    showToast('保存中…');
+    showToast('保存中…', 20000);
     lastError = '';
-    const hadData = drinks.length > 0 || history.length > 0;
-    await loadDrinksWithRetry();
-    if(lastLoadFailed) return false;
-    // 「データが空」と返ってきたのに、さっきまでデータがあった場合は
-    // 何かおかしいので保存しない（全部消えてしまうのを防ぐ）
-    if(basketMissing && hadData){ lastError = 'データが空で返ってきた'; return false; }
-    const result = applyFn();
-    if(result === false){ lastError = lastError || '対象が見つからない'; return false; }
-    const ok = await saveDrinks();
-    if(!ok){
-      await loadDrinks(); // 失敗したらサーバーの本当の状態に表示を戻す
-      return false;
+    for(let attempt = 0; attempt < 4; attempt++){
+      await loadDrinks();
+      if(lastLoadFailed) return false;
+      const result = applyFn();
+      if(result === false){ lastError = lastError || '対象が見つからない'; return false; }
+      const r = await saveDrinks();
+      if(r === 'ok') return true;
+      if(r === 'error'){
+        await loadDrinks(); // 失敗したら本当の状態に表示を戻す
+        return false;
+      }
+      await sleep(400 + Math.random() * 600); // conflict → 少し待ってやり直し
     }
-    return true;
+    lastError = 'ほかの人と同時に保存が重なった';
+    await loadDrinks();
+    return false;
   }
 
-  function renderSetup(){
+  // ===== 前の保存先（Pantry）からの引っ越し：まだ一度も保存されていないときに1回だけ =====
+  async function migrateFromPantryIfNeeded(){
+    // 一度でも保存したことがあるなら引っ越し済み（空にしたのを復活させない）
+    if(sheetInitialized) return;
+    let pid = null;
+    try{
+      pid = new URLSearchParams(window.location.search).get('pid')
+         || window.localStorage.getItem(PANTRY_KEY);
+    }catch(e){}
+    if(!pid) return;
+    try{
+      const res = await fetch(`https://getpantry.cloud/apiv1/pantry/${encodeURIComponent(pid)}/basket/${BASKET_NAME}`, { cache: 'no-store' });
+      if(!res.ok) return;
+      const old = await res.json();
+      const oldDrinks = Array.isArray(old.drinks) ? old.drinks : [];
+      const oldHistory = Array.isArray(old.history) ? old.history : [];
+      if(oldDrinks.length === 0 && oldHistory.length === 0) return;
+      drinks = oldDrinks;
+      history = oldHistory;
+      if(await saveDrinks() === 'ok'){
+        showToast(`前のデータ（${oldDrinks.length}件）を引っ越したよ`, 4000);
+      }
+    }catch(e){}
+  }
+
+  function renderNotConfigured(){
     app.innerHTML = `
       <div class="hero">
         <div class="hero-blob b1"></div>
         <div class="hero-blob b2"></div>
         <p class="hero-title">🥤 のみもの在庫ノート</p>
-        <p class="hero-sub">市高野球部⚾</p>
+        <p class="hero-sub">市高野球部⚾ <span style="font-size:10px; opacity:0.6;">${APP_VERSION}</span></p>
       </div>
-      <div class="empty-state" style="text-align:left; padding: 24px 20px;">
-        <span class="emoji" style="text-align:center; display:block;">🔗</span>
-        <p style="text-align:center; margin-bottom:20px;">みんなで同じリストを<br>見る・更新するために、<br>共有IDをつなげよう。</p>
-        <div class="field">
-          <label>共有ID（Pantry ID）</label>
-          <input type="text" id="pantryInput" placeholder="例：xxxx-xxxx-xxxx-xxxx" autocapitalize="none" autocorrect="off" spellcheck="false">
-        </div>
-        <button class="btn btn-primary" id="connectBtn" style="width:100%;">つなぐ</button>
+      <div class="empty-state">
+        <span class="emoji">🔧</span>
+        <p>保存先（Firebase）が<br>まだ設定されていません。</p>
       </div>
     `;
-    document.getElementById('connectBtn').addEventListener('click', handleConnect);
-  }
-
-  async function handleConnect(){
-    const val = document.getElementById('pantryInput').value.trim();
-    if(!val){ showToast('IDを入力してね'); return; }
-    pantryId = val;
-    try{ window.localStorage.setItem(PANTRY_KEY, pantryId); }catch(e){}
-    syncUrlWithPantryId();
-    showToast('つないでいるよ…');
-    await loadDrinksWithRetry();
-    render();
   }
 
   function openSettings(){
     sheet.innerHTML = `
       <div class="sheet-handle"></div>
-      <h2>共有の設定</h2>
-      <div class="field">
-        <label>今の共有ID</label>
-        <input type="text" id="currentIdInput" value="${escapeHtml(pantryId)}" readonly autocapitalize="none" autocorrect="off" spellcheck="false">
-        <button type="button" class="btn btn-secondary" id="copyIdBtn" style="width:100%; margin-top:8px;">IDをコピー</button>
-      </div>
+      <h2>共有について</h2>
+      <p style="font-size:13px; line-height:1.7; color:var(--text-soft);">
+        データはFirebaseに保存されています。<br>
+        このページのリンクを開けば、部員みんなが同じリストを見られます。
+      </p>
+      <button type="button" class="btn btn-secondary" id="copyLinkBtn" style="width:100%; margin-top:8px;">このページのリンクをコピー</button>
+      <p style="font-size:11px; color:var(--text-soft); text-align:center; margin-top:10px;">${APP_VERSION}</p>
       <div class="sheet-actions">
         <button class="btn btn-primary" id="cancelSettings" style="flex:1;">閉じる</button>
       </div>
     `;
     document.getElementById('cancelSettings').addEventListener('click', closeSheet);
-    document.getElementById('copyIdBtn').addEventListener('click', async ()=>{
+    document.getElementById('copyLinkBtn').addEventListener('click', async ()=>{
+      const link = window.location.origin + window.location.pathname;
       try{
-        await navigator.clipboard.writeText(pantryId);
+        await navigator.clipboard.writeText(link);
         showToast('コピーしたよ');
       }catch(e){
-        showToast('コピーできなかったよ。長押しでコピーしてね');
+        showToast('コピーできなかったよ');
       }
     });
     overlay.classList.add('show');
@@ -1187,30 +1185,22 @@ body{
   overlay.addEventListener('click', closeSheet);
 
   document.addEventListener('visibilitychange', async ()=>{
-    if(document.visibilityState === 'visible' && pantryId){
+    if(document.visibilityState === 'visible' && FIREBASE_PROJECT_ID && !syncing){
       await loadDrinks();
       render();
     }
   });
 
   (async function init(){
-    try{
-      const urlParams = new URLSearchParams(window.location.search);
-      const urlPid = urlParams.get('pid');
-      if(urlPid){
-        pantryId = urlPid;
-        try{ window.localStorage.setItem(PANTRY_KEY, pantryId); }catch(e){}
-      }else{
-        pantryId = window.localStorage.getItem(PANTRY_KEY);
-      }
-    }catch(e){ pantryId = null; }
-    if(!pantryId){
-      renderSetup();
-    }else{
-      syncUrlWithPantryId();
-      await loadDrinksWithRetry();
-      render();
+    if(!FIREBASE_PROJECT_ID){
+      renderNotConfigured();
+      return;
     }
+    await loadDrinks();
+    if(!lastLoadFailed){
+      await migrateFromPantryIfNeeded();
+    }
+    render();
   })();
 
 })();
